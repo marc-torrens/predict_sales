@@ -25,9 +25,25 @@ warnings.filterwarnings('ignore')
 class DataPreprocessor:
     """Main class for data preprocessing"""
     
-    def __init__(self, data_dir='../../data', output_dir='../../data/processed'):
-        self.data_dir = Path(data_dir)
-        self.output_dir = Path(output_dir)
+    def __init__(self, data_dir=None, output_dir=None):
+        """
+        Args:
+            data_dir: Path to raw data directory. If None, resolved as <project_root>/data
+            output_dir: Path to processed data directory. If None, resolved as <project_root>/data/processed
+        """
+        # Resolve project root as two levels above this file: <root>/src/data_processing/preprocess_data.py
+        base_dir = Path(__file__).resolve().parents[2]
+        
+        if data_dir is None:
+            self.data_dir = base_dir / 'data'
+        else:
+            self.data_dir = Path(data_dir)
+        
+        if output_dir is None:
+            self.output_dir = base_dir / 'data' / 'processed'
+        else:
+            self.output_dir = Path(output_dir)
+        
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
     def load_data(self):

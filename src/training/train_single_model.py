@@ -16,7 +16,7 @@ import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 
 from evaluate.feature_importance import get_feature_importance
-from evaluate.metrics import evaluate_model
+from evaluate.metrics import calculate_grouped_metrics, evaluate_model
 from models.model_factory import create_model
 from utils.data_loader import DataLoader
 from utils.data_splitter import create_time_split, prepare_features
@@ -88,7 +88,7 @@ class SingleModelTrainer:
         # Initialize model saver for organized saving
         self.model_saver = ModelSaver(self.model_dir)
 
-    def tune_hyperparameters(self, df_train, model_type='xgboost', cv_folds=3, n_iter=8):
+    def tune_hyperparameters(self, df_train, model_type='xgboost', cv_folds=3, n_iter=8, tune_sample_size=None):
         """
         Run time-series cross-validation to tune hyperparameters.
         Uses Bayesian optimization (BayesSearchCV) when available.
@@ -99,6 +99,7 @@ class SingleModelTrainer:
             model_type: Type of model to tune
             cv_folds: Number of CV folds
             n_iter: Number of iterations for Bayesian optimization
+            tune_sample_size: If set, uses only the most recent N rows for tuning
         """
         if cv_folds <= 1:
             print("\nCV folds <= 1, skipping hyperparameter tuning.")
@@ -124,12 +125,27 @@ class SingleModelTrainer:
         df_sorted = df_train.sort_values('date').reset_index(drop=True)
         X, y, feature_cols = prepare_features(df_sorted)
 
+        # Optional downsampling for low-resource hyperparameter tuning.
+        # We keep the most recent rows to preserve temporal relevance.
+        if tune_sample_size is not None and tune_sample_size > 0 and len(X) > tune_sample_size:
+            print(f"\nUsing tune sample size: {tune_sample_size:,} (from {len(X):,} rows)")
+            X = X.tail(tune_sample_size).reset_index(drop=True)
+            y = y.tail(tune_sample_size).reset_index(drop=True)
+            print(f"Tuning data shape after sampling: X={X.shape}, y={y.shape}")
+
         tscv = TimeSeriesSplit(n_splits=cv_folds)
         
-        if not SKOPT_AVAILABLE:
-            print("\nscikit-optimize (skopt) is not installed.")
-            print("Install it with: pip install scikit-optimize")
-            print("Falling back to a small manual grid search.\n")
+        # LightGBM in this project uses `lgb.train` with params dict from create_model,
+        # so it is not directly compatible with BayesSearchCV estimator API.
+        # Use manual time-series CV grid search for LightGBM.
+        if model_type == 'lightgbm' or not SKOPT_AVAILABLE:
+            if model_type == 'lightgbm':
+                print("\nUsing manual grid search for LightGBM.")
+                print("BayesSearchCV is not compatible with current LightGBM factory in this project.\n")
+            else:
+                print("\nscikit-optimize (skopt) is not installed.")
+                print("Install it with: pip install scikit-optimize")
+                print("Falling back to a small manual grid search.\n")
             
             # Small fallback grid based on model type
             if model_type == 'xgboost':
@@ -146,9 +162,8 @@ class SingleModelTrainer:
                 ]
             elif model_type == 'lightgbm':
                 param_grid = [
-                    {'num_leaves': 31, 'learning_rate': 0.05, 'n_estimators': 300},
-                    {'num_leaves': 50, 'learning_rate': 0.05, 'n_estimators': 500},
-                    {'num_leaves': 31, 'learning_rate': 0.1, 'n_estimators': 300},
+                    {'num_leaves': 31, 'learning_rate': 0.05, 'n_estimators': 120},
+                    {'num_leaves': 50, 'learning_rate': 0.05, 'n_estimators': 180},
                 ]
             else:
                 print(f"Fallback grid search not implemented for {model_type}")
@@ -272,8 +287,9 @@ class SingleModelTrainer:
         print(f"\nBest params from Bayesian CV: {best_params} with RMSE={best_rmse:.2f}")
         return best_params
 
-    def evaluate_model_performance(self, model, X_train, y_train, X_val, y_val, 
-                                   model_type='xgboost', feature_cols=None, calculate_shap=True):
+    def evaluate_model_performance(self, model, X_train, y_train, X_val, y_val,
+                                   model_type='xgboost', feature_cols=None, calculate_shap=True,
+                                   train_meta_df=None, val_meta_df=None):
         """
         Evaluate model performance on training and validation sets.
         Also calculates SHAP values on validation set.
@@ -303,6 +319,21 @@ class SingleModelTrainer:
         print(f"R²: {val_metrics['r2']:.4f}")
         if val_metrics.get('mape') is not None:
             print(f"MAPE: {val_metrics['mape']:.2f}%")
+
+        # Grouped validation metrics (store and family)
+        val_store_metrics = None
+        val_family_metrics = None
+        if val_meta_df is not None:
+            val_store_metrics = calculate_grouped_metrics(
+                y_val, y_val_pred, val_meta_df['store_nbr'].values, 'store_nbr'
+            )
+            val_family_metrics = calculate_grouped_metrics(
+                y_val, y_val_pred, val_meta_df['family'].values, 'family'
+            )
+            print("\nTop 5 worst stores by validation RMSE:")
+            print(val_store_metrics[['store_nbr', 'n_samples', 'rmse', 'mae']].head(5).to_string(index=False))
+            print("\nTop 5 worst families by validation RMSE:")
+            print(val_family_metrics[['family', 'n_samples', 'rmse', 'mae']].head(5).to_string(index=False))
         
         # Calculate SHAP values on validation set using model trained only on training set
         # This is the correct approach: validation set is truly unseen by this model
@@ -337,11 +368,32 @@ class SingleModelTrainer:
         print(f"R²: {train_metrics['r2']:.4f}")
         if train_metrics.get('mape') is not None:
             print(f"MAPE: {train_metrics['mape']:.2f}%")
+
+        # Grouped training metrics (store and family)
+        train_store_metrics = None
+        train_family_metrics = None
+        if train_meta_df is not None:
+            train_store_metrics = calculate_grouped_metrics(
+                y_train, y_train_pred, train_meta_df['store_nbr'].values, 'store_nbr'
+            )
+            train_family_metrics = calculate_grouped_metrics(
+                y_train, y_train_pred, train_meta_df['family'].values, 'family'
+            )
         
         return {
             'train_metrics': train_metrics,
             'val_metrics': val_metrics,
-            'shap_analysis': shap_analysis
+            'shap_analysis': shap_analysis,
+            'grouped_metrics': {
+                'train': {
+                    'by_store': train_store_metrics,
+                    'by_family': train_family_metrics,
+                },
+                'validation': {
+                    'by_store': val_store_metrics,
+                    'by_family': val_family_metrics,
+                },
+            },
         }
 
     def train_model_on_train_set(self, model_type='xgboost', X_train=None, y_train=None,
@@ -481,8 +533,9 @@ class SingleModelTrainer:
         return final_model
 
     def train_model(self, model_type='xgboost', validation_days=30,
-                    cv_folds=0, tune_hyperparams=False, n_iter=8, 
-                    calculate_shap=True):
+                    cv_folds=0, tune_hyperparams=False, n_iter=8,
+                    calculate_shap=True, skip_final_retrain=False,
+                    tune_sample_size=None):
         """Train a single global model"""
         print("="*50)
         print("TRAINING SINGLE GLOBAL MODEL")
@@ -505,7 +558,8 @@ class SingleModelTrainer:
                 df_train, 
                 model_type=model_type, 
                 cv_folds=cv_folds,
-                n_iter=n_iter
+                n_iter=n_iter,
+                tune_sample_size=tune_sample_size
             )
             if best_params and best_params.get('use_auto_arima'):
                 model_type = 'auto_arima'
@@ -532,33 +586,44 @@ class SingleModelTrainer:
         
         # Evaluate model performance (including SHAP calculation)
         evaluation_results = self.evaluate_model_performance(
-            model, X_train, y_train, X_val, y_val, model_type, feature_cols, calculate_shap
+            model, X_train, y_train, X_val, y_val, model_type, feature_cols, calculate_shap,
+            train_meta_df=df_train_split[['store_nbr', 'family']],
+            val_meta_df=df_val[['store_nbr', 'family']],
         )
         train_metrics = evaluation_results['train_metrics']
         val_metrics = evaluation_results['val_metrics']
         shap_analysis = evaluation_results['shap_analysis']
+        grouped_metrics = evaluation_results['grouped_metrics']
         
-        # Retrain final model on ALL data (train + validation)
-        print("\n" + "="*50)
-        print("RETRAINING FINAL MODEL ON ALL DATA")
-        print("="*50)
-        print("Combining training and validation sets for final model...")
-        
-        # Combine train and validation data
-        X_all = pd.concat([X_train, X_val], axis=0).reset_index(drop=True)
-        y_all = pd.concat([y_train, y_val], axis=0).reset_index(drop=True)
-        
-        print(f"Final training set size: {len(X_all):,} samples")
-        
-        # Train final model on all data
-        final_model = self.train_model_on_all_data(
-            model_type=model_type,
-            X_all=X_all,
-            y_all=y_all,
-            extra_params=extra_params
-        )
-        
-        print("Final model trained on all data.")
+        # Retrain final model on ALL data (train + validation) unless disabled.
+        # On low-RAM systems, concatenating + retraining can trigger OOM kills.
+        if skip_final_retrain:
+            print("\n" + "="*50)
+            print("SKIPPING FINAL RETRAIN (LOW-RESOURCE MODE)")
+            print("="*50)
+            print("Keeping model trained on training split only.")
+            final_model = model
+        else:
+            print("\n" + "="*50)
+            print("RETRAINING FINAL MODEL ON ALL DATA")
+            print("="*50)
+            print("Combining training and validation sets for final model...")
+            
+            # Combine train and validation data
+            X_all = pd.concat([X_train, X_val], axis=0).reset_index(drop=True)
+            y_all = pd.concat([y_train, y_val], axis=0).reset_index(drop=True)
+            
+            print(f"Final training set size: {len(X_all):,} samples")
+            
+            # Train final model on all data
+            final_model = self.train_model_on_all_data(
+                model_type=model_type,
+                X_all=X_all,
+                y_all=y_all,
+                extra_params=extra_params
+            )
+            
+            print("Final model trained on all data.")
         
         # Create organized directory structure: model_type/YYYY-MM-DD_HHMMSS/
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -576,6 +641,32 @@ class SingleModelTrainer:
         train_eval_path = self.model_saver.save_evaluation(train_metrics, model_dir, "train")
         val_eval_path = self.model_saver.save_evaluation(val_metrics, model_dir, "validation")
         summary_path = self.model_saver.create_evaluation_summary(train_metrics, val_metrics, model_dir)
+
+        # Save grouped metrics by store/family for train/validation
+        eval_dir = model_dir / "evaluations"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        grouped_metric_paths = {
+            'train_by_store': None,
+            'train_by_family': None,
+            'validation_by_store': None,
+            'validation_by_family': None,
+        }
+        if grouped_metrics.get('train', {}).get('by_store') is not None:
+            p = eval_dir / "train_metrics_by_store.csv"
+            grouped_metrics['train']['by_store'].to_csv(p, index=False)
+            grouped_metric_paths['train_by_store'] = str(p)
+        if grouped_metrics.get('train', {}).get('by_family') is not None:
+            p = eval_dir / "train_metrics_by_family.csv"
+            grouped_metrics['train']['by_family'].to_csv(p, index=False)
+            grouped_metric_paths['train_by_family'] = str(p)
+        if grouped_metrics.get('validation', {}).get('by_store') is not None:
+            p = eval_dir / "validation_metrics_by_store.csv"
+            grouped_metrics['validation']['by_store'].to_csv(p, index=False)
+            grouped_metric_paths['validation_by_store'] = str(p)
+        if grouped_metrics.get('validation', {}).get('by_family') is not None:
+            p = eval_dir / "validation_metrics_by_family.csv"
+            grouped_metrics['validation']['by_family'].to_csv(p, index=False)
+            grouped_metric_paths['validation_by_family'] = str(p)
         
         # Save feature importance
         importance_path = self.model_saver.save_feature_importance(feature_importance, model_dir)
@@ -601,7 +692,11 @@ class SingleModelTrainer:
                 'train': str(train_eval_path),
                 'validation': str(val_eval_path),
                 'summary': str(summary_path),
-                'feature_importance': str(importance_path) if importance_path else None
+                'feature_importance': str(importance_path) if importance_path else None,
+                'train_by_store': grouped_metric_paths['train_by_store'],
+                'train_by_family': grouped_metric_paths['train_by_family'],
+                'validation_by_store': grouped_metric_paths['validation_by_store'],
+                'validation_by_family': grouped_metric_paths['validation_by_family'],
             },
             'shap_directory': str(shap_dir) if shap_dir else None,
             'shap_summary': shap_summary
@@ -629,7 +724,11 @@ class SingleModelTrainer:
             print(f"  - Feature importance: {importance_path.name}")
         if shap_dir:
             print(f"  - SHAP values: {shap_dir.name}/")
-        print("\nNote: The saved model was trained on ALL data (train + validation).")
+        if skip_final_retrain:
+            print("\nNote: The saved model was trained on TRAINING split only.")
+            print("      (Final retrain on all data was skipped for low-resource mode.)")
+        else:
+            print("\nNote: The saved model was trained on ALL data (train + validation).")
         if shap_dir:
             print("      SHAP values were calculated on validation set (unseen by training model).")
         
@@ -652,12 +751,16 @@ def main():
                        help='Number of folds for time-series CV when tuning hyperparameters (only used with --tune-hyperparams, default: 3)')
     parser.add_argument('--n-iter', type=int, default=8,
                        help='Number of iterations for Bayesian hyperparameter optimization (only used with --tune-hyperparams, default: 8)')
+    parser.add_argument('--tune-sample-size', type=int, default=None,
+                       help='Rows to use for hyperparameter tuning (recent rows only, reduces RAM usage)')
     parser.add_argument('--data-dir', type=str, default=None,
                        help='Processed data directory (default: <project_root>/data/processed)')
     parser.add_argument('--model-dir', type=str, default=None,
                        help='Model directory (default: <project_root>/models)')
     parser.add_argument('--no-shap', action='store_true',
                        help='Disable SHAP value calculation (reduces memory usage)')
+    parser.add_argument('--skip-final-retrain', action='store_true',
+                       help='Skip retraining on train+validation (faster, lower RAM)')
     
     args = parser.parse_args()
     
@@ -672,7 +775,9 @@ def main():
         cv_folds=args.cv_folds,
         tune_hyperparams=args.tune_hyperparams,
         n_iter=args.n_iter,
-        calculate_shap=not args.no_shap
+        calculate_shap=not args.no_shap,
+        skip_final_retrain=args.skip_final_retrain,
+        tune_sample_size=args.tune_sample_size
     )
 
 

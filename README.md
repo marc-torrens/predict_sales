@@ -23,6 +23,8 @@ machines. Because of that, the codebase includes memory-aware options
 This project also includes explainability (SHAP) to understand which features
 drive predictions.
 
+I had problems running the scripts because of the extense of the data. For me worked lightgbm without hyperparameter finetuning and without final training over all data
+
 ## Project Highlights
 
 - End-to-end pipeline: preprocessing -> training -> iterative prediction

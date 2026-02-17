@@ -6,7 +6,8 @@ Functions for evaluating model performance.
 """
 
 import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 def calculate_metrics(y_true, y_pred):
@@ -82,5 +83,56 @@ def evaluate_model(model, X, y, model_type='xgboost'):
     metrics = calculate_metrics(y, y_pred)
     
     return metrics, y_pred
+
+
+def calculate_grouped_metrics(y_true, y_pred, group_values, group_name):
+    """
+    Calculate error metrics by group (e.g., by store_nbr or family).
+
+    Args:
+        y_true: True target values
+        y_pred: Predicted target values
+        group_values: Group labels aligned with y_true/y_pred
+        group_name: Name of grouping column for output
+
+    Returns:
+        DataFrame with grouped metrics and sample counts
+    """
+    y_pred = np.maximum(y_pred, 0)
+
+    eval_df = pd.DataFrame(
+        {
+            group_name: group_values,
+            "y_true": np.asarray(y_true),
+            "y_pred": np.asarray(y_pred),
+        }
+    )
+
+    rows = []
+    for group, grp in eval_df.groupby(group_name):
+        y_t = grp["y_true"].to_numpy()
+        y_p = grp["y_pred"].to_numpy()
+        non_zero_mask = y_t > 0
+
+        mape = None
+        if non_zero_mask.sum() > 0:
+            mape = float(
+                np.mean(np.abs((y_t[non_zero_mask] - y_p[non_zero_mask]) / y_t[non_zero_mask])) * 100
+            )
+
+        rows.append(
+            {
+                group_name: group,
+                "n_samples": int(len(grp)),
+                "rmse": float(np.sqrt(mean_squared_error(y_t, y_p))),
+                "mae": float(mean_absolute_error(y_t, y_p)),
+                "mape": mape,
+                "mean_actual": float(np.mean(y_t)),
+                "mean_pred": float(np.mean(y_p)),
+                "bias": float(np.mean(y_p - y_t)),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("rmse", ascending=False).reset_index(drop=True)
 
 

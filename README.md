@@ -1,5 +1,36 @@
 # Sales Prediction Project
 
+This repository contains my end-to-end solution for the Kaggle competition
+**Store Sales - Time Series Forecasting**:
+https://www.kaggle.com/competitions/store-sales-time-series-forecasting
+
+It is also my first personal repository built with Cursor, collaborating with
+GPT-5.3 Codex as an AI coding assistant throughout the workflow.
+
+The objective is to forecast daily sales for multiple stores and product families
+in Ecuador using time-series and tabular features. The project compares three
+training strategies:
+
+- one **single global model** for all series,
+- one model **per store-family series**,
+- and **clustered models** that group similar series.
+
+During experimentation, I found that large-scale per-series training with
+XGBoost + hyperparameter tuning is very resource-intensive on low-memory
+machines. Because of that, the codebase includes memory-aware options
+(`--no-shap`, lower CV folds/iterations, and lighter training configurations).
+
+This project also includes explainability (SHAP) to understand which features
+drive predictions.
+
+## Project Highlights
+
+- End-to-end pipeline: preprocessing -> training -> iterative prediction
+- Multiple model families: XGBoost, LightGBM, Random Forest, ARIMA variants
+- Three scalable training strategies (global, per-series, clustered)
+- Time-based validation to reduce data leakage risk
+- Model artifacts saved with metadata and evaluation summaries
+
 ## Project Structure
 
 ```
